@@ -150,10 +150,7 @@ Rollup 打包配置：
 - 官方服务器 token 和连接信息
 - 本地开发服务器路径
 
-## 贡献指南
+## Reference
 
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交改动 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送分支 (`git push origin feature/AmazingFeature`)
-5. 创建 Pull Request
+- [Screeps 官方文档](https://docs.screeps.com/)
+- [Screeps 搭建开发环境 - 导言](https://www.jianshu.com/p/895f05016ff2)
