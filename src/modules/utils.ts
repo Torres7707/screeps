@@ -151,6 +151,20 @@ export const LAYOUT_CONFIG = {
 		// 道路模式
 		RADIUS: 5, // 主要道路半径
 		SPOKES: 8, // 辐射道路数量
+		MAX_DISTANCE: 10, // 最大建造距离
+		MIN_STRUCTURES: 2, // 最小周边建筑数
+		BUILD_THRESHOLD: 0.7, // 道路建造进度阈值
+
+		// 道路优先级
+		PRIORITY: {
+			RESOURCE_PATH: 1, // 资源路径最高优先级
+			CONTROLLER_PATH: 2, // 控制器路径次优先级
+			CONSTRUCTION_PATH: 3, // 建筑路径最低优先级
+		},
+
+		// 道路检查
+		CHECK_INTERVAL: 1000, // 检查间隔（ticks）
+		REPAIR_THRESHOLD: 0.5, // 维修阈值
 	},
 
 	// 每个控制器等级允许的最大spawn数量
@@ -430,76 +444,529 @@ function manageRoomLayout(room: Room): void {
 	}
 }
 
+// 检查位置是否适合建造道路
+function isValidRoadPosition(pos: RoomPosition, room: Room): boolean {
+	const terrain = room.getTerrain();
+
+	// 检查地形
+	if (terrain.get(pos.x, pos.y) === TERRAIN_MASK_WALL) {
+		return false; // 不在墙上建路
+	}
+
+	// 检查现有建筑
+	const structures = pos.lookFor(LOOK_STRUCTURES);
+	for (const struct of structures) {
+		if (
+			struct.structureType === 'constructedWall' ||
+			struct.structureType === 'rampart'
+		) {
+			return false; // 不在墙或城墙上建路
+		}
+	}
+
+	// 检查建筑工地
+	const sites = pos.lookFor(LOOK_CONSTRUCTION_SITES);
+	for (const site of sites) {
+		if (site.structureType === 'road' && site.progress > 40000) {
+			if (terrain.get(pos.x, pos.y) === TERRAIN_MASK_WALL) {
+				site.remove(); // 移除在墙上的高进度道路工地
+				console.log(`移除位于墙上的高进度道路工地 at ${pos.x},${pos.y}`);
+				return false;
+			}
+		}
+	}
+
+	// 检查周边是否有重要建筑
+	const nearbyStructures = pos.findInRange(FIND_STRUCTURES, 2);
+	const validNearby = nearbyStructures.filter((s) =>
+		['spawn', 'extension', 'storage', 'container', 'tower'].includes(
+			s.structureType
+		)
+	);
+
+	// 如果附近没有重要建筑，检查是否在资源点或控制器附近
+	if (validNearby.length === 0) {
+		const nearbySources = pos.findInRange(FIND_SOURCES, 2);
+		const controller = room.controller;
+		const nearController = controller && pos.getRangeTo(controller) <= 3;
+
+		if (!nearbySources.length && !nearController) {
+			return false; // 没有足够理由在这里建路
+		}
+	}
+
+	return true;
+}
+
+// 计算路径的建造成本
+function calculatePathCost(path: RoomPosition[], room: Room): number {
+	let totalCost = 0;
+	path.forEach((pos) => {
+		const terrain = room.getTerrain();
+		if (terrain.get(pos.x, pos.y) === TERRAIN_MASK_WALL) {
+			totalCost += 45000; // 墙壁成本极高，应该避免
+		} else if (terrain.get(pos.x, pos.y) === TERRAIN_MASK_SWAMP) {
+			totalCost += 2000; // 沼泽地成本较高
+		} else {
+			totalCost += 1000; // 平原基础成本
+		}
+
+		// 检查周围的建筑和地形
+		for (let dy = -1; dy <= 1; dy++) {
+			for (let dx = -1; dx <= 1; dx++) {
+				const nx = pos.x + dx;
+				const ny = pos.y + dy;
+
+				if (nx >= 0 && nx < 50 && ny >= 0 && ny < 50) {
+					// 周围的墙增加成本
+					if (terrain.get(nx, ny) === TERRAIN_MASK_WALL) {
+						totalCost += 5000; // 靠近墙的惩罚
+					}
+
+					// 检查周围的建筑
+					const structures = room.lookForAt(LOOK_STRUCTURES, nx, ny);
+					for (const struct of structures) {
+						if (
+							struct.structureType === 'constructedWall' ||
+							struct.structureType === 'rampart'
+						) {
+							totalCost += 10000; // 靠近防御建筑的惩罚
+						}
+					}
+				}
+			}
+		}
+
+		// 检查现有建筑工地
+		const sites = pos.lookFor(LOOK_CONSTRUCTION_SITES);
+		sites.forEach((site) => {
+			if (site.structureType === 'road' && site.progress > 40000) {
+				totalCost += 50000; // 重复的高进度道路工地，应该避免
+			}
+		});
+	});
+	return totalCost;
+} // 尝试在位置建造道路
+function tryBuildRoad(pos: RoomPosition, room: Room): boolean {
+	// 首先验证位置的合适性
+	if (!isValidRoadPosition(pos, room)) {
+		return false;
+	}
+
+	// 已有道路或建筑工地则跳过
+	const existingRoad = pos
+		.lookFor(LOOK_STRUCTURES)
+		.find((s) => s.structureType === 'road');
+	const existingSite = pos
+		.lookFor(LOOK_CONSTRUCTION_SITES)
+		.find((s) => s.structureType === 'road');
+	if (existingRoad || existingSite) {
+		return false;
+	}
+
+	// 检查周边重要建筑
+	const nearbyStructures = pos.findInRange(FIND_STRUCTURES, 2);
+	const importantNearby = nearbyStructures.some((s) =>
+		['spawn', 'extension', 'storage', 'container', 'tower'].includes(
+			s.structureType
+		)
+	);
+
+	// 在重要位置、资源点附近或控制器附近建路
+	if (
+		importantNearby ||
+		pos.findInRange(FIND_SOURCES, 2).length > 0 ||
+		(room.controller && pos.getRangeTo(room.controller) <= 3)
+	) {
+		// 计算建路成本
+		const pathCost = calculatePathCost([pos], room);
+		if (pathCost >= 45000) {
+			return false; // 建造成本过高，可能是不合适的位置
+		}
+
+		// 尝试建造道路
+		const result = room.createConstructionSite(pos.x, pos.y, 'road');
+		if (result === OK) {
+			console.log(`在 ${pos.x},${pos.y} 新建道路工地`);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 // 规划道路网络
 function planRoads(room: Room): void {
 	const mainSpawn = LAYOUT_CONFIG.SPAWNS[0];
 	const center = new RoomPosition(mainSpawn.x, mainSpawn.y, room.name);
 
+	// 检查现有建设情况
+	const existingConstructionSites = room.find(FIND_CONSTRUCTION_SITES, {
+		filter: (site) => site.structureType === STRUCTURE_ROAD,
+	});
+
+	// 检查错误建造的道路
+	const highProgressRoads = existingConstructionSites.filter((site) => {
+		if (site.structureType !== STRUCTURE_ROAD) return false;
+		if (site.progress > 40000) {
+			const terrain = room.getTerrain();
+			if (terrain.get(site.pos.x, site.pos.y) === TERRAIN_MASK_WALL) {
+				site.remove(); // 移除墙上的道路工地
+				return true;
+			}
+		}
+		return false;
+	});
+
+	if (highProgressRoads.length > 0) {
+		console.log(
+			`发现 ${highProgressRoads.length} 个不当位置的高进度道路工地，已移除`
+		);
+	}
+
+	// 检查现有道路工地进度
+	if (existingConstructionSites.length >= 5) {
+		let totalProgress = 0;
+		let totalRequired = 0;
+
+		existingConstructionSites.forEach((site) => {
+			totalProgress += site.progress;
+			totalRequired += site.progressTotal;
+		});
+
+		// 如果现有工地进度不理想，暂停新建设
+		if (
+			totalRequired > 0 &&
+			totalProgress / totalRequired < LAYOUT_CONFIG.ROAD_PATTERN.BUILD_THRESHOLD
+		) {
+			console.log(
+				`道路建设进度不足 (${Math.floor(
+					(totalProgress / totalRequired) * 100
+				)}%)，暂停新建设`
+			);
+			return;
+		}
+	}
+
 	// 获取房间中的关键位置
-	const sources = room.find(FIND_SOURCES);
+	const sources = room.find(FIND_SOURCES).filter((source) => {
+		// 只处理合适距离内的能量源
+		const distance = center.getRangeTo(source.pos);
+		if (distance > LAYOUT_CONFIG.ROAD_PATTERN.MAX_DISTANCE) return false;
+
+		// 检查地形和建筑情况
+		const terrain = room.getTerrain();
+		const nearbyWalls = source.pos.findInRange(FIND_STRUCTURES, 1, {
+			filter: (s) => s.structureType === STRUCTURE_WALL,
+		});
+
+		// 如果周围都是墙，跳过这个能量源
+		let hasNonWallPath = false;
+		for (let dx = -1; dx <= 1; dx++) {
+			for (let dy = -1; dy <= 1; dy++) {
+				const x = source.pos.x + dx;
+				const y = source.pos.y + dy;
+				if (terrain.get(x, y) !== TERRAIN_MASK_WALL) {
+					hasNonWallPath = true;
+					break;
+				}
+			}
+			if (hasNonWallPath) break;
+		}
+
+		return hasNonWallPath;
+	});
+
 	const controller = room.controller;
-	const minerals = room.find(FIND_MINERALS);
+	const minerals = room.find(FIND_MINERALS).filter((mineral) => {
+		// 只在房间等级足够时考虑连接矿物
+		if (room.controller && room.controller.level < 6) return false;
+		// 只处理合适距离内的矿物
+		const distance = center.getRangeTo(mineral.pos);
+		return distance <= LAYOUT_CONFIG.ROAD_PATTERN.MAX_DISTANCE;
+	}); // 检查现有道路建设情况
+	const existingRoads = room.find(FIND_STRUCTURES, {
+		filter: (s) => s.structureType === STRUCTURE_ROAD,
+	});
+
+	const constructionSites = room.find(FIND_CONSTRUCTION_SITES, {
+		filter: (s) => s.structureType === STRUCTURE_ROAD,
+	});
+
+	// 如果建设中的道路超过阈值，暂停新建道路
+	if (constructionSites.length > 0) {
+		const totalProgress = constructionSites.reduce(
+			(sum, site) => sum + site.progress,
+			0
+		);
+		const totalProgressRequired = constructionSites.reduce(
+			(sum, site) => sum + site.progressTotal,
+			0
+		);
+		if (
+			totalProgress / totalProgressRequired <
+			LAYOUT_CONFIG.ROAD_PATTERN.BUILD_THRESHOLD
+		) {
+			return; // 等待现有道路完工
+		}
+	}
 
 	// 创建到各个资源点的道路
 	sources.forEach((source) => {
+		// 检查与资源点的距离
+		const distance = center.getRangeTo(source);
+		if (distance > LAYOUT_CONFIG.ROAD_PATTERN.MAX_DISTANCE) {
+			return; // 跳过距离过远的资源点
+		}
+
+		// 检查资源点是否有可行的建筑空间
+		const terrain = room.getTerrain();
+		let hasValidBuildSpace = false;
+
+		// 检查资源点周围的位置
+		for (let dy = -1; dy <= 1; dy++) {
+			for (let dx = -1; dx <= 1; dx++) {
+				const x = source.pos.x + dx;
+				const y = source.pos.y + dy;
+				if (terrain.get(x, y) !== TERRAIN_MASK_WALL) {
+					hasValidBuildSpace = true;
+					break;
+				}
+			}
+			if (hasValidBuildSpace) break;
+		}
+
+		if (!hasValidBuildSpace) {
+			return; // 跳过被墙完全包围的资源点
+		}
+
+		// 检查周边建筑情况
+		const nearbyStructures = source.pos.findInRange(FIND_STRUCTURES, 3);
+		const validNearby = nearbyStructures.filter((s) =>
+			['spawn', 'extension', 'storage', 'container', 'tower'].includes(
+				s.structureType
+			)
+		);
+
+		if (validNearby.length < LAYOUT_CONFIG.ROAD_PATTERN.MIN_STRUCTURES) {
+			return; // 跳过周边建筑较少的区域
+		}
+
 		const pfResult = PathFinder.search(
 			center,
 			{ pos: source.pos, range: 1 },
 			{
-				swampCost: 2,
 				plainCost: 2,
+				swampCost: 10,
 				roomCallback: (roomName: string) => {
 					const costs = new PathFinder.CostMatrix();
+					const terrain = room.getTerrain();
 
-					// 避开建筑物和墙壁
-					const structures = room.find(FIND_STRUCTURES);
-					structures.forEach((struct) => {
-						if (
-							struct.structureType === STRUCTURE_WALL ||
-							struct.structureType === STRUCTURE_RAMPART
+					// 设置基础地形成本
+					for (let y = 0; y < 50; y++) {
+						for (let x = 0; x < 50; x++) {
+							const terrainType = terrain.get(x, y);
+							if (terrainType === TERRAIN_MASK_WALL) {
+								costs.set(x, y, 255); // 墙壁完全不可通行
+							} else if (terrainType === TERRAIN_MASK_SWAMP) {
+								costs.set(x, y, 10); // 沼泽地代价较高
+							}
+						}
+					}
+
+					// 处理现有建筑
+					room.find(FIND_STRUCTURES).forEach((struct) => {
+						const pos = struct.pos;
+						if (struct.structureType === 'road') {
+							costs.set(pos.x, pos.y, 1); // 已有道路成本最低
+						} else if (
+							struct.structureType === 'constructedWall' ||
+							struct.structureType === 'rampart'
 						) {
-							costs.set(struct.pos.x, struct.pos.y, 255);
+							// 墙和城墙完全不可通行，并增加周围区域成本
+							costs.set(pos.x, pos.y, 255);
+
+							// 增加周围区域的成本以避免在墙附近建路
+							for (let dy = -1; dy <= 1; dy++) {
+								for (let dx = -1; dx <= 1; dx++) {
+									const nx = pos.x + dx;
+									const ny = pos.y + dy;
+									if (nx >= 0 && nx < 50 && ny >= 0 && ny < 50) {
+										const currentCost = costs.get(nx, ny);
+										if (currentCost < 255) {
+											costs.set(nx, ny, Math.min(currentCost + 20, 254));
+										}
+									}
+								}
+							}
+						}
+					});
+
+					// 处理建筑工地，特别关注高进度的道路工地
+					room.find(FIND_CONSTRUCTION_SITES).forEach((site) => {
+						if (site.structureType === STRUCTURE_ROAD) {
+							if (site.progress > 40000) {
+								// 检查是否在墙上或墙附近
+								if (terrain.get(site.pos.x, site.pos.y) === TERRAIN_MASK_WALL) {
+									costs.set(site.pos.x, site.pos.y, 255);
+									site.remove(); // 移除不合适的道路工地
+									console.log(
+										`移除位于墙上的高进度道路工地 at ${site.pos.x},${site.pos.y}`
+									);
+								}
+							}
+						} else {
+							costs.set(site.pos.x, site.pos.y, 255);
+
+							// 增加其他建筑工地周围的成本
+							for (let dy = -1; dy <= 1; dy++) {
+								for (let dx = -1; dx <= 1; dx++) {
+									const nx = site.pos.x + dx;
+									const ny = site.pos.y + dy;
+									if (nx >= 0 && nx < 50 && ny >= 0 && ny < 50) {
+										const currentCost = costs.get(nx, ny);
+										if (currentCost < 255) {
+											costs.set(nx, ny, Math.min(currentCost + 15, 254));
+										}
+									}
+								}
+							}
 						}
 					});
 
 					return costs;
 				},
 			}
-		);
-
-		// 在路径上建造道路
+		); // 智能建造道路
 		pfResult.path.forEach((pos) => {
-			room.createConstructionSite(pos.x, pos.y, STRUCTURE_ROAD);
+			// 检查是否已存在道路或建设工地
+			const existingRoad = pos
+				.lookFor(LOOK_STRUCTURES)
+				.find((s) => s.structureType === STRUCTURE_ROAD);
+			const existingSite = pos
+				.lookFor(LOOK_CONSTRUCTION_SITES)
+				.find((s) => s.structureType === STRUCTURE_ROAD);
+
+			if (!existingRoad && !existingSite) {
+				// 检查周边的建筑和道路数量
+				const nearbyStructures = pos.findInRange(FIND_STRUCTURES, 2);
+				const nearbyRoads = nearbyStructures.filter(
+					(s) => s.structureType === STRUCTURE_ROAD
+				);
+
+				// 只在有足够建筑支持的地方建路
+				if (
+					nearbyStructures.length >=
+						LAYOUT_CONFIG.ROAD_PATTERN.MIN_STRUCTURES ||
+					nearbyRoads.length > 0
+				) {
+					room.createConstructionSite(pos.x, pos.y, STRUCTURE_ROAD);
+				}
+			}
 		});
 	});
 
 	// 创建到控制器的道路
 	if (controller) {
-		const path = room.findPath(center, controller.pos, {
-			ignoreCreeps: true,
-			ignoreRoads: true,
-			swampCost: 2,
-			plainCost: 2,
-		});
+		// 检查与控制器的距离
+		const distance = center.getRangeTo(controller);
+		if (distance <= LAYOUT_CONFIG.ROAD_PATTERN.MAX_DISTANCE) {
+			const pfResult = PathFinder.search(
+				center,
+				{ pos: controller.pos, range: 1 },
+				{
+					swampCost: 2,
+					plainCost: 2,
+					roomCallback: (roomName: string) => {
+						const costs = new PathFinder.CostMatrix();
+						room.find(FIND_STRUCTURES).forEach((struct) => {
+							if (struct.structureType === STRUCTURE_ROAD) {
+								costs.set(struct.pos.x, struct.pos.y, 1);
+							} else if (
+								struct.structureType === STRUCTURE_WALL ||
+								struct.structureType === STRUCTURE_RAMPART
+							) {
+								costs.set(struct.pos.x, struct.pos.y, 255);
+							}
+						});
+						return costs;
+					},
+				}
+			);
 
-		path.forEach((pos) => {
-			room.createConstructionSite(pos.x, pos.y, STRUCTURE_ROAD);
-		});
+			// 智能建造道路
+			pfResult.path.forEach((pos) => {
+				const existingRoad = pos
+					.lookFor(LOOK_STRUCTURES)
+					.find((s) => s.structureType === STRUCTURE_ROAD);
+				const existingSite = pos
+					.lookFor(LOOK_CONSTRUCTION_SITES)
+					.find((s) => s.structureType === STRUCTURE_ROAD);
+
+				if (!existingRoad && !existingSite) {
+					// 检查周边是否有足够的建筑支持修建道路
+					const nearbyStructures = pos.findInRange(FIND_STRUCTURES, 2);
+					if (
+						nearbyStructures.length >= LAYOUT_CONFIG.ROAD_PATTERN.MIN_STRUCTURES
+					) {
+						room.createConstructionSite(pos.x, pos.y, STRUCTURE_ROAD);
+					}
+				}
+			});
+		}
 	}
 
-	// 创建到矿物的道路（如果有的话）
-	minerals.forEach((mineral) => {
-		const path = room.findPath(center, mineral.pos, {
-			ignoreCreeps: true,
-			ignoreRoads: true,
-			swampCost: 2,
-			plainCost: 2,
-		});
+	// 创建到矿物的道路（如果有的话且房间等级足够）
+	if (room.controller && room.controller.level >= 6) {
+		minerals.forEach((mineral) => {
+			const distance = center.getRangeTo(mineral);
+			if (distance <= LAYOUT_CONFIG.ROAD_PATTERN.MAX_DISTANCE) {
+				const pfResult = PathFinder.search(
+					center,
+					{ pos: mineral.pos, range: 1 },
+					{
+						swampCost: 2,
+						plainCost: 2,
+						roomCallback: (roomName: string) => {
+							const costs = new PathFinder.CostMatrix();
+							room.find(FIND_STRUCTURES).forEach((struct) => {
+								if (struct.structureType === STRUCTURE_ROAD) {
+									costs.set(struct.pos.x, struct.pos.y, 1);
+								} else if (
+									struct.structureType === STRUCTURE_WALL ||
+									struct.structureType === STRUCTURE_RAMPART
+								) {
+									costs.set(struct.pos.x, struct.pos.y, 255);
+								}
+							});
+							return costs;
+						},
+					}
+				);
 
-		path.forEach((pos) => {
-			room.createConstructionSite(pos.x, pos.y, STRUCTURE_ROAD);
+				// 智能建造道路
+				pfResult.path.forEach((pos) => {
+					const existingRoad = pos
+						.lookFor(LOOK_STRUCTURES)
+						.find((s) => s.structureType === STRUCTURE_ROAD);
+					const existingSite = pos
+						.lookFor(LOOK_CONSTRUCTION_SITES)
+						.find((s) => s.structureType === STRUCTURE_ROAD);
+
+					if (!existingRoad && !existingSite) {
+						// 检查周边是否有足够的建筑支持修建道路
+						const nearbyStructures = pos.findInRange(FIND_STRUCTURES, 2);
+						if (
+							nearbyStructures.length >=
+							LAYOUT_CONFIG.ROAD_PATTERN.MIN_STRUCTURES
+						) {
+							room.createConstructionSite(pos.x, pos.y, STRUCTURE_ROAD);
+						}
+					}
+				});
+			}
 		});
-	});
+	}
 
 	// 创建spawn之间的连接道路
 	for (let i = 1; i < LAYOUT_CONFIG.SPAWNS.length; i++) {
