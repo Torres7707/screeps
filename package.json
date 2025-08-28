@@ -1,0 +1,38 @@
+{
+	"name": "screeps",
+	"version": "1.0.0",
+	"description": "",
+	"main": "index.js",
+	"scripts": {
+		"push": "rollup -cw --bundleConfigAsCjs --environment DEST:main",
+		"local": "rollup -cw --bundleConfigAsCjs --environment DEST:local",
+		"build": "rollup -cw --bundleConfigAsCjs",
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Torres7707/screeps.git"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"bugs": {
+		"url": "https://github.com/Torres7707/screeps/issues"
+	},
+	"homepage": "https://github.com/Torres7707/screeps#readme",
+	"devDependencies": {
+		"@rollup/plugin-commonjs": "^28.0.6",
+		"@rollup/plugin-node-resolve": "^16.0.1",
+		"@types/lodash": "^4.17.20",
+		"@types/screeps": "^3.3.8",
+		"rollup": "^4.49.0",
+		"rollup-plugin-clear": "^2.0.7",
+		"rollup-plugin-copy": "^3.5.0",
+		"rollup-plugin-screeps": "^0.1.2",
+		"rollup-plugin-typescript2": "^0.36.0",
+		"typescript": "^5.9.2"
+	},
+	"dependencies": {
+		"source-map": "0.6.1"
+	}
+}
